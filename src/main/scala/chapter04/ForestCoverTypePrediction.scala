@@ -1,8 +1,11 @@
 package chapter04
 
+import org.apache.spark.ml.{Pipeline, PipelineModel}
 import org.apache.spark.ml.classification.{DecisionTreeClassificationModel, DecisionTreeClassifier}
 import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
 import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.ml.tuning.{ParamGridBuilder, TrainValidationSplit, TrainValidationSplitModel}
 import org.apache.spark.mllib.evaluation.MulticlassMetrics
 import org.apache.spark.mllib.linalg.Matrix
 import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
@@ -13,7 +16,7 @@ class ForestCoverTypePrediction(private val spark: SparkSession) {
 
   import spark.implicits._
 
-  val COV_TYPE_DATA_FILE = "/home/cy64/Downloads/covtype.data"
+  val COV_TYPE_DATA_FILE = "/Users/mmenezes/Downloads/covtype.data"
 
   private var dataWithoutHeader: DataFrame = null
 
@@ -34,6 +37,16 @@ class ForestCoverTypePrediction(private val spark: SparkSession) {
   private var evaluator: MulticlassClassificationEvaluator = null
 
   private var predictions: DataFrame = null
+
+  private var pipeline: Pipeline = null
+
+  private var paramGrid: Array[ParamMap] = null
+
+  private var validator: TrainValidationSplit = null
+
+  private var validatorModel: TrainValidationSplitModel = null
+
+  private var hyperParamsAndValidationMetrics: Array[(Double, ParamMap)] = null
 
   def getDataWithoutHeader: DataFrame = {
     if (dataWithoutHeader == null) {
@@ -158,6 +171,7 @@ class ForestCoverTypePrediction(private val spark: SparkSession) {
       evaluator = new MulticlassClassificationEvaluator()
           .setLabelCol("Cover_Type")
           .setPredictionCol("prediction")
+          .setMetricName("accuracy")
     }
 
     evaluator
@@ -205,5 +219,86 @@ class ForestCoverTypePrediction(private val spark: SparkSession) {
     trainProbabilities.zip(testProbabilities).map {
       case (trainProb, testProb) => trainProb * testProb
     }.sum
+  }
+
+  def getPipeline: Pipeline = {
+    if (pipeline == null) {
+      pipeline = new Pipeline().setStages(Array(getAssembler, getClassifier))
+    }
+
+    pipeline
+  }
+
+  def getParamGrid: Array[ParamMap] = {
+    if (paramGrid == null) {
+      val classifier = getClassifier
+      paramGrid = new ParamGridBuilder()
+          .addGrid(classifier.impurity, Seq("gini", "entropy"))
+          .addGrid(classifier.maxDepth, Seq(1, 20))
+          .addGrid(classifier.maxBins, Seq(40, 300))
+          .addGrid(classifier.minInfoGain, Seq(0.0, 0.05))
+          .build()
+    }
+
+    paramGrid
+  }
+
+  def getValidator: TrainValidationSplit = {
+    if (validator == null) {
+      validator = new TrainValidationSplit()
+          .setSeed(Random.nextLong())
+          .setEstimator(getPipeline)
+          .setEvaluator(getEvaluator)
+          .setEstimatorParamMaps(getParamGrid)
+          .setTrainRatio(0.9)
+    }
+
+    validator
+  }
+
+  def getValidatorModel: TrainValidationSplitModel = {
+    if (validatorModel == null) {
+      validatorModel = getValidator.fit(getTrainDataAndTestData._1)
+    }
+
+    validatorModel
+
+  }
+
+  def extractParamMapFromBestModel: ParamMap = {
+    val validatorModel = getValidatorModel
+
+    validatorModel.bestModel.asInstanceOf[PipelineModel].stages.last.extractParamMap
+  }
+
+  def getHyperParamsAndValidationMetrics: Array[(Double, ParamMap)] = {
+    if (hyperParamsAndValidationMetrics == null) {
+      val validatorModel = getValidatorModel
+
+      hyperParamsAndValidationMetrics = validatorModel.validationMetrics
+        .zip(validatorModel.getEstimatorParamMaps)
+        .sortBy(_._1)
+    }
+
+    hyperParamsAndValidationMetrics
+  }
+
+  def printHyperParamsAndValidationMetrics: Unit = {
+    getHyperParamsAndValidationMetrics.foreach { case (metric, params) =>
+      println(metric)
+      println(params)
+      println()
+    }
+  }
+
+  def getAccuracyOnCrossValidationData: Double = {
+    getValidatorModel.validationMetrics.max
+  }
+
+  def getAccuracyOnTestData: Double = {
+    val validatorModel = getValidatorModel
+    val testData = getTrainDataAndTestData._2
+
+    getEvaluator.evaluate(validatorModel.bestModel.transform(testData))
   }
 }
