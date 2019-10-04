@@ -8,7 +8,7 @@ import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 
 import scala.util.Random
 
-class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
+class NetworkTrafficAnomalyDetection(private val spark: SparkSession) extends java.io.Serializable {
 
   import spark.implicits._
 
@@ -37,8 +37,6 @@ class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
   private var withCluster: DataFrame = null
 
   private var withClusterGroupedByLabelAndCluster: DataFrame = null
-
-  private var thresholdMap: Map[Int, Double] = Map()
 
   def getDataWithoutHeader: DataFrame = {
     if (dataWithoutHeader == null) {
@@ -331,24 +329,6 @@ class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
       orderBy("cluster", "label")
   }
 
-  def getThreshold(k: Int): Double = {
-    if (thresholdMap.get(k).isEmpty) {
-      val data = getData
-      val pipelineModel = getPipelineWithCategoricalFeatures(data, k).fit(data)
-      val kMeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
-      val centroids = kMeansModel.clusterCenters
-      val clustered = pipelineModel.transform(data)
-      val threshold = clustered.
-        select("cluster", "scaledFeatureVector").as[(Int, Vector)]
-        .map { case (cluster, vec) => Vectors.sqdist(centroids(cluster), vec) }
-        .orderBy($"value".desc).take(100).last
-
-      thresholdMap += (k -> threshold)
-    }
-
-    thresholdMap.get(k).get
-  }
-
   def getAnomaliesFromData(k: Int): DataFrame = {
     val data = getData
     val pipelineModel = getPipelineWithCategoricalFeatures(data, k).fit(data)
@@ -357,10 +337,15 @@ class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
     val clustered = pipelineModel.transform(data)
     val centroids = kMeansModel.clusterCenters
 
+    val threshold = clustered.
+      select("cluster", "scaledFeatureVector").as[(Int, Vector)]
+      .map { case (cluster, vec) => Vectors.sqdist(centroids(cluster), vec) }
+      .orderBy($"value".desc).take(100).last
+
     val anomalies = clustered.filter { row =>
       val cluster = row.getAs[Int]("cluster")
       val vec = row.getAs[Vector]("scaledFeatureVector")
-      Vectors.sqdist(centroids(cluster), vec) >= getThreshold((k))
+      Vectors.sqdist(centroids(cluster), vec) >= threshold
     }.select(originalCols.head, originalCols.tail:_*)
 
     anomalies
