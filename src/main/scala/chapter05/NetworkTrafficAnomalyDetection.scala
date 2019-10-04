@@ -3,8 +3,8 @@ package chapter05
 import org.apache.spark.ml.{Pipeline, PipelineModel}
 import org.apache.spark.ml.clustering.{KMeans, KMeansModel}
 import org.apache.spark.ml.feature.{OneHotEncoder, StandardScaler, StringIndexer, VectorAssembler}
-import org.apache.spark.ml.linalg.Vector
-import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
+import org.apache.spark.ml.linalg.{Vector, Vectors}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 
 import scala.util.Random
 
@@ -37,6 +37,8 @@ class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
   private var withCluster: DataFrame = null
 
   private var withClusterGroupedByLabelAndCluster: DataFrame = null
+
+  private var thresholdMap: Map[Int, Double] = Map()
 
   def getDataWithoutHeader: DataFrame = {
     if (dataWithoutHeader == null) {
@@ -192,8 +194,27 @@ class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
   }
 
   def clusteringScore2(data: DataFrame, k: Int): Double = {
-    val assembler = getAssembler
-//      .setOutputCol("scaledFeatureVector")
+    val pipeline = getPipelineWithCategoricalFeatures(data, k)
+
+    val pipelineModel = pipeline.fit(data)
+
+    val kMeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
+
+    kMeansModel.computeCost(pipelineModel.transform(data)) / data.count()
+  }
+
+  def getPipelineWithCategoricalFeatures(data: DataFrame, k: Int): Pipeline = {
+    val (protoTypeEncoder, protoTypeVecCol) = oneHotPipeline("protocol_type")
+    val (serviceEncoder, serviceVecCol) = oneHotPipeline("service")
+    val (flagEncoder, flagVecCol) = oneHotPipeline("flag")
+
+    // Original columns, without label / string columns, but with new vector encoded cols
+    val assembleCols = Set(data.columns: _*) --
+      Seq("label", "protocol_type", "service", "flag") ++
+      Seq(protoTypeVecCol, serviceVecCol, flagVecCol)
+    val assembler = new VectorAssembler().
+      setInputCols(assembleCols.toArray).
+      setOutputCol("featureVector")
 
     val scaler = new StandardScaler()
       .setInputCol("featureVector")
@@ -201,19 +222,18 @@ class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
       .setWithStd(true)
       .setWithMean(false)
 
-    val kmeans = new KMeans()
-      .setSeed(Random.nextLong())
-      .setK(k)
-      .setPredictionCol("cluster")
-      .setFeaturesCol("scaledFeatureVector")
-      .setMaxIter(40)
-      .setTol(1.0e-5)
+    val kmeans = new KMeans().
+      setSeed(Random.nextLong()).
+      setK(k).
+      setPredictionCol("cluster").
+      setFeaturesCol("scaledFeatureVector").
+      setMaxIter(40).
+      setTol(1.0e-5)
 
-    val pipeline = new Pipeline().setStages(Array(assembler, scaler, kmeans))
+    val pipeline = new Pipeline().setStages(
+      Array(protoTypeEncoder, serviceEncoder, flagEncoder, assembler, scaler, kmeans))
 
-    val pipelineModel = fitData(pipeline, data)
-
-    kmeansModel.computeCost(pipelineModel.transform(data)) / data.count()
+    pipeline
   }
 
   def computeCostOf0(range: Range): Seq[(Int, Double)] = {
@@ -225,13 +245,19 @@ class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
   }
 
   def computeCostOf2(range: Range): Seq[(Int, Double)] = {
-    computeCostOf(range, clusteringScore2)
+    computeCostOfWithData(range, getData, clusteringScore2)
   }
 
   def computeCostOf(range: Range,
                     clusteringScore: (DataFrame, Int) => Double): Seq[(Int, Double)] = {
     val numericOnlyData = getNumericOnlyData
     range.map(k => (k, clusteringScore(numericOnlyData, k)))
+  }
+
+  def computeCostOfWithData(range: Range,
+                            data: DataFrame,
+                            clusteringScore: (DataFrame, Int) => Double): Seq[(Int, Double)] = {
+    range.map(k => (k, clusteringScore(data, k)))
   }
 
   def oneHotPipeline(inputCol: String): (Pipeline, String) = {
@@ -257,22 +283,86 @@ class NetworkTrafficAnomalyDetection(private val spark: SparkSession) {
     }.sum
   }
 
-  def getClusterLabel: Dataset[(Int, String)] = {
-    getPipelineModel.transform(getData)
+  def getClusterLabel(pipelineModel: PipelineModel): Dataset[(Int, String)] = {
+    pipelineModel.transform(getData)
       .select("cluster", "label").as[(Int, String)]
   }
 
-  def getAverageEntropyWeight: Double = {
-    val weightedClusterEntropy = getClusterLabel
-      .groupByKey { case (cluster, _) => cluster }
-      .mapGroups { case (_, clusterLabels) =>
-        val labels = clusterLabels.map { case (_, label) => label }.toSeq
+  def getAverageEntropyWeight(k: Int): Double = {
+    val data = getData
+
+    val pipelineModel = getPipelineWithCategoricalFeatures(data, k).fit(data)
+
+    val weightedClusterEntropy = getClusterLabel(pipelineModel)
+      .groupByKey { case (cluster, _) => cluster } // group by cluster name
+      .mapGroups { case (_, clusterLabels) => // get all labels per cluster
+
+        // labels of a specific cluster
+        val labels = clusterLabels
+          .map { case (_, label) => label }
+          .toSeq
+
+        // counts number of elements in each label of the cluster
         val labelCounts = labels.groupBy(identity).values.map(_.size)
+
+        // weight cluster entropy : number of labels in cluster multiplied by entropy
         labels.size * entropy(labelCounts)
       }.collect()
 
     weightedClusterEntropy.sum / data.count()
   }
 
+  def fitModel(k: Int): KMeansModel = {
+    val data = getData
 
+    val pipeline = getPipelineWithCategoricalFeatures(data, k)
+
+    val kMeansModel = fitData(pipeline, data)
+
+    kMeansModel
+  }
+
+  def getCountByClusterLabel(k: Int): Dataset[Row]= {
+    val data = getData
+
+    getPipelineWithCategoricalFeatures(data, k).fit(data).transform(data).
+      select("cluster", "label").
+      groupBy("cluster", "label").count().
+      orderBy("cluster", "label")
+  }
+
+  def getThreshold(k: Int): Double = {
+    if (thresholdMap.get(k).isEmpty) {
+      val data = getData
+      val pipelineModel = getPipelineWithCategoricalFeatures(data, k).fit(data)
+      val kMeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
+      val centroids = kMeansModel.clusterCenters
+      val clustered = pipelineModel.transform(data)
+      val threshold = clustered.
+        select("cluster", "scaledFeatureVector").as[(Int, Vector)]
+        .map { case (cluster, vec) => Vectors.sqdist(centroids(cluster), vec) }
+        .orderBy($"value".desc).take(100).last
+
+      thresholdMap += (k -> threshold)
+    }
+
+    thresholdMap.get(k).get
+  }
+
+  def getAnomaliesFromData(k: Int): DataFrame = {
+    val data = getData
+    val pipelineModel = getPipelineWithCategoricalFeatures(data, k).fit(data)
+    val kMeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
+    val originalCols = data.columns
+    val clustered = pipelineModel.transform(data)
+    val centroids = kMeansModel.clusterCenters
+
+    val anomalies = clustered.filter { row =>
+      val cluster = row.getAs[Int]("cluster")
+      val vec = row.getAs[Vector]("scaledFeatureVector")
+      Vectors.sqdist(centroids(cluster), vec) >= getThreshold((k))
+    }.select(originalCols.head, originalCols.tail:_*)
+
+    anomalies
+  }
 }
