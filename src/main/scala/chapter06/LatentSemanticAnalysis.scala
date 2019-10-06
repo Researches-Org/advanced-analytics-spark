@@ -11,7 +11,8 @@ import edu.umd.cloud9.collection.wikipedia.language.EnglishWikipediaPage
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.io.{LongWritable, Text}
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel, IDF, IDFModel}
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession, functions}
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -33,6 +34,18 @@ class LatentSemanticAnalysis(private val spark: SparkSession,
   private var stopWords: Set[String] = null
 
   private var terms: Dataset[(String, Seq[String])] = null
+
+  private var termsDf: DataFrame = null
+
+  private var filteredTermsDf: DataFrame = null
+
+  private var model: CountVectorizerModel = null
+
+  private var docTermFreqs: DataFrame = null
+
+  private var idfModel: IDFModel = null
+
+  private var docTermMatrix: DataFrame = null
 
   def getStopWords(): Set[String] = {
     if (stopWords == null) {
@@ -64,6 +77,13 @@ class LatentSemanticAnalysis(private val spark: SparkSession,
     terms
   }
 
+  def getTermsDf(): DataFrame = {
+    if (termsDf == null) {
+      termsDf = getTerms().toDF("title", "terms")
+    }
+    termsDf
+  }
+
   def getConfiguration(): Configuration = {
     if (conf == null) {
       conf = new Configuration()
@@ -72,6 +92,77 @@ class LatentSemanticAnalysis(private val spark: SparkSession,
     }
 
     conf
+  }
+
+  def getFilteredTermsDf(): DataFrame = {
+    if (filteredTermsDf == null) {
+      filteredTermsDf = getTermsDf().where(functions.size($"terms") > 1)
+    }
+
+    filteredTermsDf
+  }
+
+  def createCountVectorizer(): CountVectorizer = {
+    val numTerms = 20000
+
+    new CountVectorizer()
+      .setInputCol("terms")
+      .setOutputCol("termFreqs")
+      .setVocabSize(numTerms)
+  }
+
+  def createIdf(): IDF = {
+    new IDF().setInputCol("termFreqs").setOutputCol("tfidfVec")
+  }
+
+  def fitIdfModel(): IDFModel = {
+    if (idfModel == null) {
+      idfModel = createIdf().fit(getDocTermFreqs())
+    }
+
+    idfModel
+  }
+
+  def getDocTermMatrix(): DataFrame = {
+    if (docTermMatrix == null) {
+      docTermMatrix = fitIdfModel()
+        .transform(getDocTermFreqs())
+        .select("title", "tfidfVec")
+    }
+
+    docTermMatrix
+  }
+
+  def fitModel(): CountVectorizerModel = {
+    if (model == null) {
+      val countVectorizer = createCountVectorizer()
+
+      model = countVectorizer.fit(getFilteredTermsDf())
+    }
+
+    model
+  }
+
+  def getTermIds(): Array[String] = {
+    fitModel().vocabulary
+  }
+
+  def getDocIds: Map[Long, String] = {
+    getDocTermFreqs().rdd
+      .map(_.getString(0))
+      .zipWithUniqueId()
+      .map(_.swap)
+      .collect()
+      .toMap  
+  }
+
+  def getDocTermFreqs(): DataFrame = {
+    if (docTermFreqs == null) {
+      docTermFreqs = fitModel().transform(getFilteredTermsDf())
+      docTermFreqs.cache()
+    }
+
+    docTermFreqs
   }
 
   def getRawXmls(): Dataset[String] = {
