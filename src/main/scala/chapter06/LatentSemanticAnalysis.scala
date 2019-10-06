@@ -1,17 +1,28 @@
 package chapter06
 
+import java.util.Properties
+import java.util.function.Consumer
+
+import edu.stanford.nlp.ling.CoreAnnotations.{LemmaAnnotation, SentencesAnnotation, TokensAnnotation}
+import edu.stanford.nlp.pipeline.{Annotation, StanfordCoreNLP}
 import edu.umd.cloud9.collection.XMLInputFormat
 import edu.umd.cloud9.collection.wikipedia.WikipediaPage
 import edu.umd.cloud9.collection.wikipedia.language.EnglishWikipediaPage
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.io.{LongWritable, Text}
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.{Dataset, SparkSession}
 
-class LatentSemanticAnalysis(private val spark: SparkSession) {
+import scala.collection.mutable.ArrayBuffer
+
+class LatentSemanticAnalysis(private val spark: SparkSession,
+                             private val filePrefix: String) extends java.io.Serializable {
 
   import spark.implicits._
 
   val path = "/chapter06/wikidump.xml"
+
+  val stopWordsFile = "/chapter06/stopwords.txt"
 
   @transient var conf: Configuration = null
 
@@ -19,7 +30,41 @@ class LatentSemanticAnalysis(private val spark: SparkSession) {
 
   private var docText: Dataset[(String, String)] = null
 
-  def getConfiguration: Configuration = {
+  private var stopWords: Set[String] = null
+
+  private var terms: Dataset[(String, Seq[String])] = null
+
+  def getStopWords(): Set[String] = {
+    if (stopWords == null) {
+      stopWords = scala.io.Source.fromFile(filePrefix + "/" + stopWordsFile).getLines().toSet
+    }
+
+    stopWords
+  }
+
+  def broadcastStopWords(): Broadcast[Set[String]] = {
+    spark.sparkContext.broadcast(getStopWords())
+  }
+
+  def getTerms(): Dataset[(String, Seq[String])] = {
+
+    if (terms == null) {
+      val bStopWords = broadcastStopWords()
+
+      terms = getDocText().mapPartitions {
+        iter =>
+          val pipeline = createNLPPipeline()
+          iter.map {
+            case (title, contents) =>
+              (title, plainTextToLemmas(contents, bStopWords.value, pipeline))
+          }
+      }
+    }
+
+    terms
+  }
+
+  def getConfiguration(): Configuration = {
     if (conf == null) {
       conf = new Configuration()
       conf.set(XMLInputFormat.START_TAG_KEY, "<page>")
@@ -29,7 +74,7 @@ class LatentSemanticAnalysis(private val spark: SparkSession) {
     conf
   }
 
-  def getRawXmls(filePrefix: String): Dataset[String] = {
+  def getRawXmls(): Dataset[String] = {
     if (rawXmls == null) {
       val kvs = spark.sparkContext
         .newAPIHadoopFile(filePrefix + "/" + path,
@@ -44,9 +89,9 @@ class LatentSemanticAnalysis(private val spark: SparkSession) {
     rawXmls
   }
 
-  def getDocText(filePrefix: String): Dataset[(String, String)] = {
+  def getDocText(): Dataset[(String, String)] = {
     if (docText == null) {
-      docText = getRawXmls(filePrefix)
+      docText = getRawXmls()
         .filter(_ != null)
         .flatMap(wikiXmlToPlainText)
     }
@@ -67,6 +112,40 @@ class LatentSemanticAnalysis(private val spark: SparkSession) {
     } else {
       Some((page.getTitle, page.getContent))
     }
+  }
+
+  def createNLPPipeline(): StanfordCoreNLP = {
+    val props = new Properties()
+    props.put("annotators", "tokenize, ssplit, pos, lemma")
+
+    new StanfordCoreNLP(props)
+  }
+
+  def isOnlyLetters(str: String): Boolean = {
+    str.forall(c => Character.isLetter(c))
+  }
+
+  def plainTextToLemmas(text: String,
+                        stopWords: Set[String],
+                        pipeline: StanfordCoreNLP): Seq[String] = {
+
+    val doc = new Annotation(text)
+    pipeline.annotate(doc)
+
+    val lemmas = new ArrayBuffer[String]()
+    val sentences = doc.get(classOf[SentencesAnnotation])
+
+
+    for (sentence <- convertToScala(sentences);
+         token <- convertToScala(sentence.get(classOf[TokensAnnotation]))) {
+
+      val lemma = token.get(classOf[LemmaAnnotation])
+      if (lemma.length > 2 && !stopWords.contains(lemma) && isOnlyLetters(lemma)) {
+        lemmas += lemma.toLowerCase
+      }
+    }
+
+    lemmas
   }
 
   /**
@@ -91,4 +170,15 @@ class LatentSemanticAnalysis(private val spark: SparkSession) {
     tf * idf
   }
 
+  def convertToScala[T](list: java.util.List[T]): Seq[T] = {
+    val buffer: ArrayBuffer[T] = new ArrayBuffer[T]()
+
+    list.forEach(new Consumer[T] {
+      override def accept(t: T): Unit = buffer += t
+    })
+
+    buffer
+  }
+
 }
+
