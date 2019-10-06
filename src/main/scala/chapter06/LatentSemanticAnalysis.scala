@@ -28,4 +28,6 @@ class LatentSemanticAnalysis(private val spark: SparkSession) {
     tf * idf
   }
 
+  
+
 }
