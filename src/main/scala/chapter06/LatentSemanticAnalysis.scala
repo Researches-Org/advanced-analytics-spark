@@ -13,6 +13,9 @@ import org.apache.hadoop.io.{LongWritable, Text}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel, IDF, IDFModel}
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession, functions}
+import org.apache.spark.mllib.linalg.{Matrix, SingularValueDecomposition, Vectors, Vector => MLLibVector}
+import org.apache.spark.mllib.linalg.distributed.RowMatrix
+import org.apache.spark.rdd.RDD
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -46,6 +49,84 @@ class LatentSemanticAnalysis(private val spark: SparkSession,
   private var idfModel: IDFModel = null
 
   private var docTermMatrix: DataFrame = null
+
+  private var vecRdd: RDD[MLLibVector] = null
+
+  private var svd: SingularValueDecomposition[RowMatrix, Matrix] = null
+
+  def getTopTermsInTopConcepts(
+                              svd: SingularValueDecomposition[RowMatrix, Matrix],
+                              numConcepts: Int,
+                              numTerms: Int,
+                              termIds: Array[String]): Seq[Seq[(String, Double)]] = {
+    val v = svd.V
+    val topTerms = new ArrayBuffer[Seq[(String, Double)]]()
+    val arr = v.toArray
+
+    for (i <- 0 until numConcepts) {
+      val offs = i * v.numRows
+      val termWeights = arr.slice(offs, offs + v.numRows).zipWithIndex
+      val sorted = termWeights.sortBy(-_._1)
+      topTerms += sorted.take(numTerms).map {
+        case (score, id) => (getTermIds()(id), score)
+      }
+    }
+
+    topTerms
+  }
+
+  def getTopDocsInTopConcepts(
+                               svd: SingularValueDecomposition[RowMatrix, Matrix],
+                               numConcepts: Int,
+                               numDocs: Int,
+                               docIds: Map[Long, String]
+                             ): Seq[Seq[(String, Double)]] = {
+    val u = svd.U
+    val topDocs = new ArrayBuffer[Seq[(String, Double)]]()
+
+    for (i <- 0 until numConcepts) {
+      val docWeights = u.rows.map(_.toArray(i)).zipWithUniqueId()
+      topDocs += docWeights.top(numDocs).map {
+        case (score, id) => (getDocIds()(id), score)
+      }
+    }
+
+    topDocs
+  }
+
+  def printTopTermsAndDocs(numConcepts: Int, numTerms: Int, numDocs: Int) = {
+    val svd = getSvd()
+    val topConceptTerms = getTopTermsInTopConcepts(svd, numConcepts, numTerms, getTermIds())
+    val topConceptDocs = getTopDocsInTopConcepts(svd, numConcepts, numDocs, getDocIds())
+
+    for ((terms, docs) <- topConceptTerms.zip(topConceptDocs)) {
+      println("Concept terms: " + terms.map(_._1).mkString(", "))
+      println("Concept docs: " + docs.map(_._1).mkString(", "))
+    }
+  }
+
+  def getVecRdd(): RDD[MLLibVector] = {
+    if (vecRdd == null) {
+      vecRdd = getDocTermMatrix()
+        .select("tfidfVec")
+        .rdd.map {
+          row => Vectors.fromML(row.getAs[org.apache.spark.ml.linalg.Vector]("tfidfVec"))
+      }
+      vecRdd.cache()
+    }
+
+    vecRdd
+  }
+
+  def getSvd(): SingularValueDecomposition[RowMatrix, Matrix] = {
+    if (svd == null) {
+      val mat = new RowMatrix(getVecRdd())
+
+      svd = mat.computeSVD(1000, computeU = true)
+    }
+
+    svd
+  }
 
   def getStopWords(): Set[String] = {
     if (stopWords == null) {
@@ -147,13 +228,13 @@ class LatentSemanticAnalysis(private val spark: SparkSession,
     fitModel().vocabulary
   }
 
-  def getDocIds: Map[Long, String] = {
+  def getDocIds(): Map[Long, String] = {
     getDocTermFreqs().rdd
       .map(_.getString(0))
       .zipWithUniqueId()
       .map(_.swap)
       .collect()
-      .toMap  
+      .toMap
   }
 
   def getDocTermFreqs(): DataFrame = {
@@ -198,7 +279,7 @@ class LatentSemanticAnalysis(private val spark: SparkSession,
 
     WikipediaPage.readPage(page, hackedPageXml)
 
-    if (page.isEmpty) {
+    if (page.isEmpty || !page.isArticle || page.isRedirect || page.getTitle.contains("(disambiguation)")) {
       None
     } else {
       Some((page.getTitle, page.getContent))
@@ -272,4 +353,3 @@ class LatentSemanticAnalysis(private val spark: SparkSession,
   }
 
 }
-
