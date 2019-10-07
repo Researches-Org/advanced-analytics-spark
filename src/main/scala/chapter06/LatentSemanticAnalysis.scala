@@ -13,7 +13,7 @@ import org.apache.hadoop.io.{LongWritable, Text}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel, IDF, IDFModel}
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession, functions}
-import org.apache.spark.mllib.linalg.{Matrix, SingularValueDecomposition, Vectors, Vector => MLLibVector}
+import org.apache.spark.mllib.linalg.{Matrices, Matrix, SingularValueDecomposition, Vectors, Vector => MLLibVector}
 import org.apache.spark.mllib.linalg.distributed.RowMatrix
 import org.apache.spark.rdd.RDD
 
@@ -53,6 +53,127 @@ class LatentSemanticAnalysis(private val spark: SparkSession,
   private var vecRdd: RDD[MLLibVector] = null
 
   private var svd: SingularValueDecomposition[RowMatrix, Matrix] = null
+
+  val VS: breeze.linalg.DenseMatrix[Double] = multiplyByDiagonalMatrix(getSvd().V, getSvd().s)
+
+  val normalizedVS: breeze.linalg.DenseMatrix[Double] = rowsNormalized(VS)
+
+  val US: RowMatrix = multiplyByDiagonalRowMatrix(getSvd().U, getSvd().s)
+
+  val normalizedUS: RowMatrix = distributedRowsNormalized(US)
+
+  var idTerms: Map[String, Int] = null
+
+  var idDocs: Map[String, Long] = null
+
+  def getIdTerms(): Map[String, Int] = {
+    if (idTerms == null) {
+      idTerms = getTermIds().zipWithIndex.toMap
+    }
+
+    idTerms
+  }
+
+  def getIdDocs(): Map[String, Long] = {
+    if (idDocs == null) {
+      idDocs = getDocIds().map(_.swap)
+    }
+
+    idDocs
+  }
+
+  def topTermsForTerm(termId: Int): Seq[(Double, Int)] = {
+    val rowVec = normalizedVS(termId, ::).t
+    val termScores = (normalizedVS * rowVec).toArray.zipWithIndex
+
+    termScores.sortBy(-_._1).take(10)
+  }
+
+  def printTopTermsForTerm(term: String): Unit = {
+    val idWeights = topTermsForTerm(getIdTerms()(term))
+    println(idWeights.map { case (score, id) =>
+      (getTermIds()(id), score)
+    }.mkString(", "))
+  }
+
+  def topDocsForDoc(docId: Long): Seq[(Double, Long)] = {
+    val docRowArr = normalizedUS.rows.zipWithUniqueId.map(_.swap)
+      .lookup(docId).head.toArray
+    val docRowVec = Matrices.dense(docRowArr.length, 1, docRowArr)
+    val docScores = normalizedUS.multiply(docRowVec)
+    val allDocWeights = docScores.rows.map(_.toArray(0)).
+      zipWithUniqueId()
+    allDocWeights.filter(!_._1.isNaN).top(10)
+  }
+
+  def printTopDocsForDoc(doc: String): Unit = {
+    val idWeights = topDocsForDoc(getIdDocs()(doc))
+    println(idWeights.map { case (score, id) =>
+      (getDocIds()(id), score)
+    }.mkString(", "))
+  }
+
+  def topDocsForTerm(termId: Int): Seq[(Double, Long)] = {
+    val rowArr = (0 until getSvd().V.numCols).
+      map(i => getSvd().V(termId, i)).toArray
+    val rowVec = Matrices.dense(rowArr.length, 1, rowArr)
+    val docScores = US.multiply(rowVec)
+    val allDocWeights = docScores.rows.map(_.toArray(0)).
+      zipWithUniqueId()
+    allDocWeights.top(10)
+  }
+
+  def printTopDocsForTerm(term: String): Unit = {
+    val idWeights = topDocsForTerm(getIdTerms()(term))
+    println(idWeights.map { case (score, id) =>
+      (getDocIds()(id), score)
+    }.mkString(", "))
+  }
+
+  /**
+   * Returns a distributed matrix where each row is divided by its length.
+   */
+  def distributedRowsNormalized(mat: RowMatrix): RowMatrix = {
+    new RowMatrix(mat.rows.map { vec =>
+      val array = vec.toArray
+      val length = math.sqrt(array.map(x => x * x).sum)
+      Vectors.dense(array.map(_ / length))
+    })
+  }
+
+  /**
+   * Returns a matrix where each row is divided by its length.
+   */
+  def rowsNormalized(mat: breeze.linalg.DenseMatrix[Double]): breeze.linalg.DenseMatrix[Double] = {
+    val newMat = new breeze.linalg.DenseMatrix[Double](mat.rows, mat.cols)
+    for (r <- 0 until mat.rows) {
+      val length = math.sqrt((0 until mat.cols).map(c => mat(r, c) * mat(r, c)).sum)
+      (0 until mat.cols).foreach(c => newMat.update(r, c, mat(r, c) / length))
+    }
+    newMat
+  }
+
+  /**
+   * Finds the product of a distributed matrix and a diagonal matrix represented by a vector.
+   */
+  def multiplyByDiagonalRowMatrix(mat: RowMatrix, diag: MLLibVector): RowMatrix = {
+    val sArr = diag.toArray
+    new RowMatrix(mat.rows.map { vec =>
+      val vecArr = vec.toArray
+      val newArr = (0 until vec.size).toArray.map(i => vecArr(i) * sArr(i))
+      Vectors.dense(newArr)
+    })
+  }
+
+  /**
+   * Finds the product of a dense matrix and a diagonal matrix represented by a vector.
+   * Breeze doesn't support efficient diagonal representations, so multiply manually.
+   */
+  def multiplyByDiagonalMatrix(mat: Matrix, diag: MLLibVector): breeze.linalg.DenseMatrix[Double] = {
+    val sArr = diag.toArray
+    new breeze.linalg.DenseMatrix[Double](mat.numRows, mat.numCols, mat.toArray)
+      .mapPairs { case ((r, c), v) => v * sArr(c) }
+  }
 
   def getTopTermsInTopConcepts(
                               svd: SingularValueDecomposition[RowMatrix, Matrix],
