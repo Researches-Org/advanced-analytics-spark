@@ -308,8 +308,8 @@ class CoOccurrence(spark: SparkSession, filePrefix: String) extends java.io.Seri
     chiSquaredGraph
   }
 
-  def getChiSquaredGraphStats(): StatCounter = {
-    getChiSquaredGraph().edges.map(x => x.attr).stats()
+  def getChiSquaredGraphStats(T: Long): StatCounter = {
+    getChiSquaredGraph(T).edges.map(x => x.attr).stats()
   }
 
 
