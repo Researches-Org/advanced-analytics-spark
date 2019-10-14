@@ -6,7 +6,7 @@ import java.security.MessageDigest
 import edu.umd.cloud9.collection.XMLInputFormat
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.io.{LongWritable, Text}
-import org.apache.spark.graphx.{Edge, Graph, VertexId, VertexRDD}
+import org.apache.spark.graphx.{Edge, EdgeTriplet, Graph, VertexId, VertexRDD}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession, functions}
 import org.apache.spark.util.StatCounter
@@ -300,7 +300,8 @@ class CoOccurrence(spark: SparkSession, filePrefix: String) extends java.io.Seri
     T * math.pow(inner, 2) / (YA * NA * YB * NB)
   }
 
-  def getChiSquaredGraph(T: Long): Graph[Long, Double] = {
+  def getChiSquaredGraph(): Graph[Long, Double] = {
+    val T = getMedline().count()
     val chiSquaredGraph = getTopicDistGraph().mapTriplets(triplet => {
       chiSq(triplet.attr, triplet.srcAttr, triplet.dstAttr, T)
     })
@@ -308,10 +309,78 @@ class CoOccurrence(spark: SparkSession, filePrefix: String) extends java.io.Seri
     chiSquaredGraph
   }
 
-  def getChiSquaredGraphStats(T: Long): StatCounter = {
-    getChiSquaredGraph(T).edges.map(x => x.attr).stats()
+  def getChiSquaredGraphStats(): StatCounter = {
+    getChiSquaredGraph().edges.map(x => x.attr).stats()
   }
 
+  def getInterestingGraph(): Graph[Long, Double] = {
+    val interesting = getChiSquaredGraph().subgraph(
+      triplet => triplet.attr > 19.5)
+
+    interesting
+  }
+
+  def getTriCountGraph(): Graph[Int, Double] = {
+    val triCountGraph = getInterestingGraph().triangleCount()
+
+    triCountGraph
+  }
+
+  def getTriCountGraphStats(): StatCounter = {
+    getTriCountGraph().vertices.map(x => x._2).stats()
+  }
+
+  def getMaxTrisGraph(): VertexRDD[Double] = {
+     getInterestingGraph().degrees.mapValues(d => d * (d - 1) / 2.0)
+  }
+
+  def getClusterCoeficient() = {
+    getTriCountGraph().vertices.
+      innerJoin(getMaxTrisGraph()) {
+        (vertexId, triCount, maxTris) => {
+          if (maxTris == 0) 0 else triCount / maxTris
+        }
+      }
+  }
+
+  def mergeMaps(m1: Map[VertexId, Int], m2: Map[VertexId, Int]): Map[VertexId, Int] = {
+
+    def minThatExists(k: VertexId): Int = {
+      math.min(
+        m1.getOrElse(k, Int.MaxValue),
+        m2.getOrElse(k, Int.MaxValue))
+    }
+
+    (m1.keySet ++ m2.keySet).map {
+      k => (k, minThatExists(k))
+    }.toMap
+
+  }
+
+  def update(id: VertexId,
+             state: Map[VertexId, Int],
+             msg: Map[VertexId, Int]) = {
+    mergeMaps(state, msg)
+  }
+
+  def checkIncrement(a: Map[VertexId, Int],
+                     b: Map[VertexId, Int],
+                     bid: VertexId) = {
+
+    val aplus = a.map { case (v, d) => v -> (d + 1) }
+
+    if (b != mergeMaps(aplus, b)) {
+      Iterator((bid, aplus))
+    } else {
+      Iterator.empty
+    }
+
+  }
+
+  def iterate(e: EdgeTriplet[Map[VertexId, Int], _]) = {
+    checkIncrement(e.srcAttr, e.dstAttr, e.dstId) ++
+      checkIncrement(e.dstAttr, e.srcAttr, e.srcId)
+  }
 
   def getXml(position: Int): Elem = {
     val xmlStr = loadMedline().take(position)(position - 1)
