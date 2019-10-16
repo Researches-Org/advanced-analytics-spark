@@ -1,8 +1,9 @@
 package chapter08
 
 import com.esri.core.geometry.{Geometry, GeometryEngine}
-import spray.json.{JsValue, RootJsonFormat}
-import spray.json._
+import spray.json.{JsValue, RootJsonFormat, _}
+
+import scala.collection.immutable.Map
 
 object GeoJsonProtocol extends DefaultJsonProtocol {
 

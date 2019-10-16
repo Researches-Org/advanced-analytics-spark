@@ -1,6 +1,8 @@
 package chapter08
 
-class RichRow(row: org.apache.spark.sql.Row) {
+import org.apache.spark.sql.Row
+
+class RichRow(row: Row) {
 
   def getAs[T](field: String): Option[T] = {
 
