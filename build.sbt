@@ -5,7 +5,7 @@ version := "1.0"
 scalaVersion := "2.11.12"
 
 resolvers ++= Seq(
-  "Cloudera" at "ttps://repository.cloudera.com/artifactory/cloudera-repos",
+  "Cloudera" at "https://repository.cloudera.com/artifactory/cloudera-repos",
   "Cludera-local" at "https://repository.cloudera.com/artifactory/libs-release-local"
 )
 
